@@ -12,12 +12,16 @@ answers while charging a per-dataset ε (epsilon) privacy budget.
 - **Idempotent** releases: retrying with the same idempotency key returns the
   *exact same* release (same `id`, same noise, same value) and never charges
   the budget twice. Reusing a key with different parameters returns `409`.
+- **Budget transfers**: unused ε can be moved from one dataset to another
+  inside a single SQLite transaction (`POST /budgets/transfer`). The same
+  idempotency rules apply via `transfer_id`.
 
 ## Endpoints
 
 | Method | Path                    | Description                                             |
 |--------|-------------------------|---------------------------------------------------------|
 | POST   | `/releases`             | Validate budget, deduct ε, return a noised release      |
+| POST   | `/budgets/transfer`     | Move unused ε from one dataset to another (idempotent)  |
 | GET    | `/budgets/{dataset_id}` | Used and remaining budget only                          |
 | GET    | `/health`               | Health check                                            |
 | GET    | `/docs`                 | Interactive Swagger UI                                  |
@@ -80,7 +84,64 @@ Returns only used and remaining amounts (never released values):
 ```
 
 Unknown datasets report `used_budget = 0` and the configured total as
-remaining.
+remaining. The remaining amount reflects any budget moved in or out via
+`/budgets/transfer`; already-consumed budget (`used_budget`) is never
+transferred.
+
+### `POST /budgets/transfer`
+
+Moves **unused** ε from `source_dataset` to `target_dataset` in a single
+`BEGIN IMMEDIATE` transaction. Both balances are locked before any change, so
+the whole transfer is atomic: if the source cannot cover the requested ε the
+transaction rolls back and neither side changes.
+
+Request body:
+
+```json
+{
+  "transfer_id": "client-uuid-9c1b...",
+  "source_dataset": "sales",
+  "target_dataset": "marketing",
+  "epsilon": 0.2
+}
+```
+
+`200` response (remaining balances, before and after the move):
+
+```json
+{
+  "id": "client-uuid-9c1b...",
+  "source_dataset": "sales",
+  "target_dataset": "marketing",
+  "epsilon": 0.2,
+  "source_remaining_before": 0.7,
+  "source_remaining_after": 0.5,
+  "target_remaining_before": 1.0,
+  "target_remaining_after": 1.2
+}
+```
+
+Only unused budget moves: a dataset that has `total = 1.0` and
+`used = 0.8` has `0.2` available to transfer, and the source keeps its
+`used_budget`. The target can subsequently release the regranted ε through
+`POST /releases`.
+
+Idempotency:
+
+- Retrying with the **same `transfer_id` and identical parameters** returns
+  the original transfer record; balances are not moved twice.
+- Reusing a `transfer_id` with **different parameters** returns `409`.
+
+Status codes:
+
+- `200` — transfer applied, or identical idempotent retry replayed
+- `409` — `transfer_id` already exists with different parameters
+- `402` — source remaining budget is smaller than the requested ε
+  (`detail.error = "insufficient_transferable_budget"`, including the
+  source's remaining amount for locating the failure)
+- `422` — invalid request (ε ≤ 0, NaN/Infinity, missing/extra fields, or
+  source and target are the same dataset with
+  `detail.error = "same_source_and_target"`)
 
 ## Quick start with Docker Compose
 
@@ -163,6 +224,15 @@ curl -s -X POST http://localhost:8000/releases \
 # repeat the exact request -> byte-identical response, budget charged once
 
 curl -s http://localhost:8000/budgets/sales
+
+# move 0.2 of unused epsilon from sales to marketing
+curl -s -X POST http://localhost:8000/budgets/transfer \
+  -H 'Content-Type: application/json' \
+  -d '{"transfer_id":"move-001","source_dataset":"sales",
+       "target_dataset":"marketing","epsilon":0.2}'
+
+# repeat the exact transfer -> same record, budget moved once
+curl -s http://localhost:8000/budgets/marketing
 ```
 
 ## Design notes
@@ -178,6 +248,17 @@ curl -s http://localhost:8000/budgets/sales
 - **Idempotency:** `idempotency_key` has a `UNIQUE` constraint. Retries replay
   the stored row; the lost side of a same-key insert race rolls back and
   replays the winner instead of double-charging.
+- **Transfers:** `/budgets/transfer` runs in the same `BEGIN IMMEDIATE`
+  transaction model. It materialises both budget rows, reads them while
+  holding the write lock, checks the source's `total - used`, then debits and
+  credits the two `total` columns — `used` is untouched, so already-spent ε
+  can never be moved. The transfer is recorded in a `transfers` table keyed
+  by `transfer_id`; identical retries replay that record, parameter drift
+  yields `409`, and any failure rolls the whole transaction back.
+- **Budget storage:** a dataset's configured total is seeded once on first
+  touch. Transfers then own the stored `total`, and `GET /budgets` reads it
+  back instead of recomputing from configuration, so regranted ε survives
+  later releases.
 - **Privacy:** budget accounting is basic ε-sum bookkeeping with no
   composition niceties; release values are returned to the caller (this is a
   release service), while the budget endpoint exposes amounts only.

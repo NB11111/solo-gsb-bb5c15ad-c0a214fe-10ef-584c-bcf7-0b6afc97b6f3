@@ -51,5 +51,27 @@ class BudgetResponse(BaseModel):
     remaining_budget: float
 
 
+class TransferRequest(BaseModel):
+    transfer_id: IdempotencyKey = Field(
+        ..., description="Client-generated key; retries with the same key replay the transfer"
+    )
+    source_dataset: Identifier = Field(..., description="Dataset whose unused budget is debited")
+    target_dataset: Identifier = Field(..., description="Dataset receiving the unused budget")
+    epsilon: FiniteFloat = Field(..., gt=0, description="Unused epsilon moved between datasets")
+
+    model_config = {"extra": "forbid"}
+
+
+class TransferResponse(BaseModel):
+    id: str
+    source_dataset: str
+    target_dataset: str
+    epsilon: float
+    source_remaining_before: float
+    source_remaining_after: float
+    target_remaining_before: float
+    target_remaining_after: float
+
+
 class HealthResponse(BaseModel):
     status: str

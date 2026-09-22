@@ -239,6 +239,212 @@ class ApiTests(unittest.TestCase):
             status, _ = _request("POST", "/releases", payload)
             self.assertEqual(status, 422)
 
+    def test_11_transfer_moves_unused_budget(self) -> None:
+        status, body = _request(
+            "POST",
+            "/budgets/transfer",
+            {
+                "transfer_id": "t1",
+                "source_dataset": "txsrc",
+                "target_dataset": "txtgt",
+                "epsilon": 0.4,
+            },
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["id"], "t1")
+        self.assertAlmostEqual(body["source_remaining_before"], 1.0, places=9)
+        self.assertAlmostEqual(body["source_remaining_after"], 0.6, places=9)
+        self.assertAlmostEqual(body["target_remaining_before"], 1.0, places=9)
+        self.assertAlmostEqual(body["target_remaining_after"], 1.4, places=9)
+
+        _, source = _request("GET", "/budgets/txsrc")
+        self.assertAlmostEqual(source["used_budget"], 0.0, places=9)
+        self.assertAlmostEqual(source["remaining_budget"], 0.6, places=9)
+        _, target = _request("GET", "/budgets/txtgt")
+        self.assertAlmostEqual(target["used_budget"], 0.0, places=9)
+        self.assertAlmostEqual(target["remaining_budget"], 1.4, places=9)
+
+    def test_12_transfer_idempotent_replay(self) -> None:
+        payload = {
+            "transfer_id": "t1",
+            "source_dataset": "txsrc",
+            "target_dataset": "txtgt",
+            "epsilon": 0.4,
+        }
+        _, first = _request("POST", "/budgets/transfer", payload)
+        _, second = _request("POST", "/budgets/transfer", payload)
+        self.assertEqual(first, second)
+        _, source = _request("GET", "/budgets/txsrc")
+        self.assertAlmostEqual(source["remaining_budget"], 0.6, places=9)
+        _, target = _request("GET", "/budgets/txtgt")
+        self.assertAlmostEqual(target["remaining_budget"], 1.4, places=9)
+
+    def test_13_same_transfer_id_changed_params_conflict(self) -> None:
+        for payload in (
+            {"transfer_id": "t1", "source_dataset": "txsrc",
+             "target_dataset": "txtgt", "epsilon": 0.41},
+            {"transfer_id": "t1", "source_dataset": "other",
+             "target_dataset": "txtgt", "epsilon": 0.4},
+            {"transfer_id": "t1", "source_dataset": "txsrc",
+             "target_dataset": "other", "epsilon": 0.4},
+        ):
+            status, _ = _request("POST", "/budgets/transfer", payload)
+            self.assertEqual(status, 409)
+        # Conflicts never moved any budget.
+        _, source = _request("GET", "/budgets/txsrc")
+        self.assertAlmostEqual(source["remaining_budget"], 0.6, places=9)
+        _, target = _request("GET", "/budgets/txtgt")
+        self.assertAlmostEqual(target["remaining_budget"], 1.4, places=9)
+
+    def test_14_transfer_same_source_and_target(self) -> None:
+        status, body = _request(
+            "POST",
+            "/budgets/transfer",
+            {
+                "transfer_id": "t-loop",
+                "source_dataset": "loop",
+                "target_dataset": "loop",
+                "epsilon": 0.1,
+            },
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(body["detail"]["error"], "same_source_and_target")
+        _, budget = _request("GET", "/budgets/loop")
+        self.assertAlmostEqual(budget["remaining_budget"], 1.0, places=9)
+
+    def test_15_transfer_insufficient_then_exact_remaining(self) -> None:
+        status, body = _request(
+            "POST",
+            "/budgets/transfer",
+            {
+                "transfer_id": "t-too-much",
+                "source_dataset": "tpoor",
+                "target_dataset": "tpoor-dst",
+                "epsilon": 1.001,
+            },
+        )
+        self.assertEqual(status, 402)
+        self.assertEqual(body["detail"]["error"], "insufficient_transferable_budget")
+        # Rejected transfer changes nothing on either side.
+        _, source = _request("GET", "/budgets/tpoor")
+        self.assertAlmostEqual(source["remaining_budget"], 1.0, places=9)
+        _, target = _request("GET", "/budgets/tpoor-dst")
+        self.assertAlmostEqual(target["remaining_budget"], 1.0, places=9)
+
+        # Transferring exactly the remaining epsilon succeeds.
+        status, body = _request(
+            "POST",
+            "/budgets/transfer",
+            {
+                "transfer_id": "t-exact",
+                "source_dataset": "tpoor",
+                "target_dataset": "tpoor-dst",
+                "epsilon": 1.0,
+            },
+        )
+        self.assertEqual(status, 200, body)
+        self.assertAlmostEqual(body["source_remaining_after"], 0.0, places=9)
+        self.assertAlmostEqual(body["target_remaining_after"], 2.0, places=9)
+
+    def test_16_transferred_budget_is_usable_for_releases(self) -> None:
+        # txtgt received 0.4 in test_11, so its usable total is 1.4.
+        status, body = _request(
+            "POST",
+            "/releases",
+            {
+                "dataset_id": "txtgt",
+                "query_id": "q",
+                "epsilon": 1.3,
+                "sensitivity": 1.0,
+                "true_value": 1.0,
+                "idempotency_key": "tgt-rel",
+            },
+        )
+        self.assertEqual(status, 200, body)
+        self.assertAlmostEqual(body["budget_remaining"], 0.1, places=9)
+
+        # txsrc gave away 0.4, so only 0.6 can still be released.
+        status, _ = _request(
+            "POST",
+            "/releases",
+            {
+                "dataset_id": "txsrc",
+                "query_id": "q",
+                "epsilon": 0.7,
+                "sensitivity": 1.0,
+                "true_value": 1.0,
+                "idempotency_key": "src-over",
+            },
+        )
+        self.assertEqual(status, 402)
+        status, _ = _request(
+            "POST",
+            "/releases",
+            {
+                "dataset_id": "txsrc",
+                "query_id": "q",
+                "epsilon": 0.6,
+                "sensitivity": 1.0,
+                "true_value": 1.0,
+                "idempotency_key": "src-exact",
+            },
+        )
+        self.assertEqual(status, 200)
+
+    def test_17_concurrent_transfers_one_wins(self) -> None:
+        def call(i: int):
+            return _request(
+                "POST",
+                "/budgets/transfer",
+                {
+                    "transfer_id": f"pool-{i}",
+                    "source_dataset": "tpool",
+                    "target_dataset": f"sink-{i}",
+                    "epsilon": 1.0,
+                },
+            )[0]
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            codes = list(pool.map(call, range(16)))
+        self.assertEqual(codes.count(200), 1)
+        self.assertEqual(codes.count(402), 15)
+        _, budget = _request("GET", "/budgets/tpool")
+        self.assertAlmostEqual(budget["remaining_budget"], 0.0, places=9)
+
+    def test_18_concurrent_same_transfer_id_single_move(self) -> None:
+        payload = {
+            "transfer_id": "t-same-id",
+            "source_dataset": "tidem-a",
+            "target_dataset": "tidem-b",
+            "epsilon": 0.25,
+        }
+
+        def call(_i: int):
+            return _request("POST", "/budgets/transfer", payload)
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(pool.map(call, range(32)))
+        self.assertTrue(all(code == 200 for code, _ in results))
+        self.assertEqual(len({body["id"] for _, body in results}), 1)
+        _, a = _request("GET", "/budgets/tidem-a")
+        self.assertAlmostEqual(a["remaining_budget"], 0.75, places=9)
+        _, b = _request("GET", "/budgets/tidem-b")
+        self.assertAlmostEqual(b["remaining_budget"], 1.25, places=9)
+
+    def test_19_transfer_validation(self) -> None:
+        bad = [
+            {"transfer_id": "x", "source_dataset": "a", "target_dataset": "b",
+             "epsilon": 0},
+            {"transfer_id": "x", "source_dataset": "a", "target_dataset": "b",
+             "epsilon": float("nan")},
+            {"transfer_id": "x", "source_dataset": "a", "target_dataset": "b",
+             "epsilon": 0.1, "extra": 2},
+            {"source_dataset": "a", "target_dataset": "b", "epsilon": 0.1},
+        ]
+        for payload in bad:
+            status, _ = _request("POST", "/budgets/transfer", payload)
+            self.assertEqual(status, 422, payload)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

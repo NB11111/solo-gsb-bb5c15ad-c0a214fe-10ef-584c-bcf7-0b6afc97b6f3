@@ -11,14 +11,22 @@ from fastapi.responses import JSONResponse
 from .config import settings
 from .db import connect, immediate_transaction, init_db
 from .privacy import derive_laplace_noise
-from .schemas import BudgetResponse, HealthResponse, ReleaseRequest, ReleaseResponse
+from .schemas import (
+    BudgetResponse,
+    HealthResponse,
+    ReleaseRequest,
+    ReleaseResponse,
+    TransferRequest,
+    TransferResponse,
+)
 from .security import resolve_server_key
 
 app = FastAPI(
     title="Differential Privacy Budget Release API",
     version="1.0.0",
-    description="Charges epsilon budgets transactionally and releases "
-    "Laplace-noised aggregates with idempotent retries.",
+    description="Charges epsilon budgets transactionally, transfers unused "
+    "budget between datasets, and releases Laplace-noised aggregates with "
+    "idempotent retries.",
 )
 
 # Resolved once at startup: env-supplied key, or a persisted random key.
@@ -33,12 +41,29 @@ _REPLAY_FIELDS = (
     "true_value",
 )
 
+# Fields that must be identical when a transfer id is reused.
+_TRANSFER_REPLAY_FIELDS = (
+    "source_dataset",
+    "target_dataset",
+    "epsilon",
+)
+
 # Float tolerance when comparing a retry against the stored release.
 _EPSILON_COMPARE_TOL = 1e-12
+# Tolerance covers binary float rounding when a transfer exactly exhausts
+# the remaining budget.
+_BALANCE_TOL = 1e-9
 
 
 class _ReplayRelease(Exception):
     """Raised inside a transaction when a same-key race must be replayed."""
+
+    def __init__(self, row: sqlite3.Row) -> None:
+        self.row = row
+
+
+class _ReplayTransfer(Exception):
+    """Raised inside a transaction when a same-id transfer race replays."""
 
     def __init__(self, row: sqlite3.Row) -> None:
         self.row = row
@@ -101,16 +126,41 @@ def _row_to_release(row: sqlite3.Row) -> ReleaseResponse:
     )
 
 
-def _params_match(row: sqlite3.Row, req: ReleaseRequest) -> bool:
-    for field in _REPLAY_FIELDS:
+def _row_to_transfer(row: sqlite3.Row) -> TransferResponse:
+    return TransferResponse(
+        id=row["id"],
+        source_dataset=row["source_dataset"],
+        target_dataset=row["target_dataset"],
+        epsilon=row["epsilon"],
+        source_remaining_before=row["source_remaining_before"],
+        source_remaining_after=row["source_remaining_after"],
+        target_remaining_before=row["target_remaining_before"],
+        target_remaining_after=row["target_remaining_after"],
+    )
+
+
+def _stored_matches(
+    row: sqlite3.Row, fields: tuple[str, ...], values: dict[str, object]
+) -> bool:
+    for field in fields:
         stored = row[field]
-        incoming = getattr(req, field)
+        incoming = values[field]
         if isinstance(stored, float):
-            if abs(stored - incoming) > _EPSILON_COMPARE_TOL * max(1.0, abs(stored), abs(incoming)):
+            if abs(stored - incoming) > _EPSILON_COMPARE_TOL * max(
+                1.0, abs(stored), abs(incoming)
+            ):
                 return False
         elif stored != incoming:
             return False
     return True
+
+
+def _params_match(row: sqlite3.Row, req: ReleaseRequest) -> bool:
+    return _stored_matches(row, _REPLAY_FIELDS, vars(req))
+
+
+def _transfer_params_match(row: sqlite3.Row, req: TransferRequest) -> bool:
+    return _stored_matches(row, _TRANSFER_REPLAY_FIELDS, vars(req))
 
 
 def _idempotency_key(request: Request, payload: ReleaseRequest) -> str:
@@ -155,9 +205,11 @@ def create_release(
                 return _row_to_release(existing)
 
             # Ensure a budget row exists and lock/freeze it for this transaction.
+            # ON CONFLICT DO NOTHING keeps any regranted total (transferred in
+            # via /budgets/transfer) intact.
             conn.execute(
                 "INSERT INTO budgets (dataset_id, total, used) VALUES (?, ?, 0) "
-                "ON CONFLICT(dataset_id) DO UPDATE SET total = excluded.total",
+                "ON CONFLICT(dataset_id) DO NOTHING",
                 (payload.dataset_id, total_budget),
             )
             budget = conn.execute(
@@ -244,24 +296,149 @@ def create_release(
         return _row_to_release(replay.row)
 
 
+@app.post(
+    "/budgets/transfer",
+    response_model=TransferResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["budgets"],
+)
+def transfer_budget(payload: TransferRequest) -> TransferResponse:
+    if payload.source_dataset == payload.target_dataset:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "same_source_and_target",
+                "source_dataset": payload.source_dataset,
+                "target_dataset": payload.target_dataset,
+            },
+        )
+
+    try:
+        with immediate_transaction() as conn:
+            existing = conn.execute(
+                "SELECT * FROM transfers WHERE id = ?",
+                (payload.transfer_id,),
+            ).fetchone()
+            if existing is not None:
+                if not _transfer_params_match(existing, payload):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="transfer_id was already used with different parameters",
+                    )
+                # Identical retry: replay the stored transfer, balances untouched.
+                return _row_to_transfer(existing)
+
+            # Materialise both budget rows at their configured defaults so the
+            # transfer is the single source of truth for balance changes.
+            for dataset_id in (payload.source_dataset, payload.target_dataset):
+                conn.execute(
+                    "INSERT INTO budgets (dataset_id, total, used) VALUES (?, ?, 0) "
+                    "ON CONFLICT(dataset_id) DO NOTHING",
+                    (dataset_id, settings.budget_for(dataset_id)),
+                )
+            # Read both rows under the reserved write lock so no concurrent
+            # transfer can change them mid-transaction (SQLite allows a single
+            # writer, hence no cross-row deadlock).
+            source = conn.execute(
+                "SELECT total, used FROM budgets WHERE dataset_id = ?",
+                (payload.source_dataset,),
+            ).fetchone()
+            target = conn.execute(
+                "SELECT total, used FROM budgets WHERE dataset_id = ?",
+                (payload.target_dataset,),
+            ).fetchone()
+
+            source_remaining = float(source["total"]) - float(source["used"])
+            target_remaining = float(target["total"]) - float(target["used"])
+            # Tolerance covers binary float rounding when the transfer exactly
+            # exhausts the remaining budget.
+            if payload.epsilon > source_remaining + _BALANCE_TOL:
+                raise HTTPException(
+                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                    detail={
+                        "error": "insufficient_transferable_budget",
+                        "source_dataset": payload.source_dataset,
+                        "target_dataset": payload.target_dataset,
+                        "source_remaining_budget": source_remaining,
+                        "requested_epsilon": payload.epsilon,
+                    },
+                )
+
+            source_after = source_remaining - payload.epsilon
+            target_after = target_remaining + payload.epsilon
+            conn.execute(
+                "UPDATE budgets SET total = total - ? WHERE dataset_id = ?",
+                (payload.epsilon, payload.source_dataset),
+            )
+            conn.execute(
+                "UPDATE budgets SET total = total + ? WHERE dataset_id = ?",
+                (payload.epsilon, payload.target_dataset),
+            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO transfers (
+                        id, source_dataset, target_dataset, epsilon,
+                        source_remaining_before, source_remaining_after,
+                        target_remaining_before, target_remaining_after
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        payload.transfer_id,
+                        payload.source_dataset,
+                        payload.target_dataset,
+                        payload.epsilon,
+                        source_remaining,
+                        source_after,
+                        target_remaining,
+                        target_after,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # Lost a race against another transaction with the same id.
+                winner = conn.execute(
+                    "SELECT * FROM transfers WHERE id = ?",
+                    (payload.transfer_id,),
+                ).fetchone()
+                if winner is not None and _transfer_params_match(winner, payload):
+                    raise _ReplayTransfer(winner)
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="transfer_id was already used with different parameters",
+                )
+
+            stored = conn.execute(
+                "SELECT * FROM transfers WHERE id = ?",
+                (payload.transfer_id,),
+            ).fetchone()
+            return _row_to_transfer(stored)
+    except _ReplayTransfer as replay:
+        return _row_to_transfer(replay.row)
+
+
 @app.get(
     "/budgets/{dataset_id}",
     response_model=BudgetResponse,
     tags=["budgets"],
 )
 def get_budget(dataset_id: str) -> BudgetResponse:
-    total_budget = settings.budget_for(dataset_id)
     conn = connect()
     try:
         row = conn.execute(
-            "SELECT used FROM budgets WHERE dataset_id = ?",
+            "SELECT total, used FROM budgets WHERE dataset_id = ?",
             (dataset_id,),
         ).fetchone()
     finally:
         conn.close()
-    used = 0.0 if row is None else float(row["used"])
+    if row is None:
+        # Never-seen dataset: configured default total, nothing spent or moved.
+        total = settings.budget_for(dataset_id)
+        used = 0.0
+    else:
+        total = float(row["total"])
+        used = float(row["used"])
     return BudgetResponse(
         dataset_id=dataset_id,
         used_budget=used,
-        remaining_budget=total_budget - used,
+        remaining_budget=total - used,
     )
