@@ -31,6 +31,21 @@ CREATE TABLE IF NOT EXISTS releases (
 );
 
 CREATE INDEX IF NOT EXISTS idx_releases_dataset ON releases(dataset_id);
+
+CREATE TABLE IF NOT EXISTS transfers (
+    id               TEXT PRIMARY KEY,
+    source_dataset   TEXT NOT NULL,
+    target_dataset   TEXT NOT NULL,
+    epsilon          REAL NOT NULL,
+    source_used      REAL NOT NULL,
+    source_remaining REAL NOT NULL,
+    target_used      REAL NOT NULL,
+    target_remaining REAL NOT NULL,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_transfers_source ON transfers(source_dataset);
+CREATE INDEX IF NOT EXISTS idx_transfers_target ON transfers(target_dataset);
 """
 
 

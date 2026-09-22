@@ -4,7 +4,14 @@ from __future__ import annotations
 import re
 from typing_extensions import Annotated
 
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import (
+    BaseModel,
+    Field,
+    StringConstraints,
+    ValidationInfo,
+    field_validator,
+)
+from pydantic_core import PydanticCustomError
 
 _ID_PATTERN = re.compile(r"^[\w.:@\- ]+$")
 
@@ -49,6 +56,37 @@ class BudgetResponse(BaseModel):
     dataset_id: str
     used_budget: float
     remaining_budget: float
+
+
+class TransferRequest(BaseModel):
+    transfer_id: IdempotencyKey = Field(
+        ..., description="Client-generated key; retries replay the same transfer"
+    )
+    source_dataset: Identifier = Field(..., description="Dataset whose unused quota is moved out")
+    target_dataset: Identifier = Field(..., description="Dataset receiving the quota")
+    epsilon: FiniteFloat = Field(..., gt=0, description="Unused epsilon quota moved between datasets")
+
+    @field_validator("target_dataset")
+    @classmethod
+    def _datasets_must_differ(cls, value: str, info: ValidationInfo) -> str:
+        source = info.data.get("source_dataset")
+        if source is not None and value == source:
+            raise PydanticCustomError(
+                "same_source_and_target",
+                "target_dataset must differ from source_dataset",
+            )
+        return value
+
+    model_config = {"extra": "forbid"}
+
+
+class TransferResponse(BaseModel):
+    transfer_id: str
+    source_dataset: str
+    target_dataset: str
+    epsilon: float
+    source: BudgetResponse
+    target: BudgetResponse
 
 
 class HealthResponse(BaseModel):
